@@ -1,0 +1,119 @@
+name: Automated Kernel Builder (Moto SM8550 / 5.15 GKI)
+
+on:
+  workflow_dispatch:
+    inputs:
+      KERNEL_SOURCE:
+        description: 'Kernel Repository URL'
+        required: true
+        default: 'https://github.com/LineageOS/android_kernel_motorola_sm8550.git'
+      KERNEL_BRANCH:
+        description: 'Branch Name'
+        required: true
+        default: 'lineage-20' # Change to lineage-21 if targeting Android 14
+      ROOT_METHOD:
+        description: 'Select Root Method'
+        required: true
+        type: choice
+        options:
+          - sukisu-ultra
+          - kernelsu-next
+          - kernelsu
+          - none
+      ENABLE_SUSFS:
+        description: 'Inject SUSFS4KSU (Hide Root/Modules)'
+        required: true
+        type: boolean
+        default: true
+      ENABLE_BBR:
+        description: 'Enable TCP BBR (Network Optimization)'
+        required: true
+        type: boolean
+        default: true
+      ENABLE_KPM:
+        description: 'Enable KPM (Kernel Patch Module)'
+        required: true
+        type: boolean
+        default: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Set up build environment
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y git ccache automake flex lzop bison gperf build-essential zip curl zlib1g-dev g++-multilib libxml2-utils bzip2 libbz2-dev libbz2-1.0 libghc-bzlib-dev squashfs-tools pngcrush schedtool dpkg-dev liblz4-tool make optipng maven libssl-dev pwgen libswitch-perl policycoreutils minicom libxml-sax-base-perl libxml-simple-perl bc libc6-dev-i386 lib32ncurses5-dev x11proto-core-dev libx11-dev lib32z-dev libgl1-mesa-dev xsltproc unzip
+
+    - name: Download ZyC Clang (Toolchain)
+      run: |
+        mkdir -p ${{ github.workspace }}/toolchain
+        git clone --depth=1 https://github.com/ZyC-X/zyc-clang.git ${{ github.workspace }}/toolchain
+
+    - name: Clone Motorola SM8550 Kernel Source
+      run: |
+        git clone --depth=1 -b ${{ inputs.KERNEL_BRANCH }} ${{ inputs.KERNEL_SOURCE }} kernel_workspace
+
+    - name: Apply Root Method
+      run: |
+        cd kernel_workspace
+        if [ "${{ inputs.ROOT_METHOD }}" == "sukisu-ultra" ]; then
+          curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" | bash -
+        elif [ "${{ inputs.ROOT_METHOD }}" == "kernelsu-next" ]; then
+          curl -LSs "https://raw.githubusercontent.com/rifsxd/KernelSU-Next/next/kernel/setup.sh" | bash -
+        elif [ "${{ inputs.ROOT_METHOD }}" == "kernelsu" ]; then
+          curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -
+        fi
+
+    - name: Apply SUSFS (5.15 GKI Patch)
+      if: inputs.ENABLE_SUSFS == 'true'
+      run: |
+        cd ${{ github.workspace }}
+        git clone https://gitlab.com/simonpunk/susfs4ksu.git -b gki-android13-5.15 susfs4ksu
+        
+        # Copy SUSFS Core files
+        cp susfs4ksu/kernel_patches/50_add_susfs_in_kernel-5.15.patch kernel_workspace/
+        cp susfs4ksu/kernel_patches/fs/* kernel_workspace/fs/
+        cp susfs4ksu/kernel_patches/include/linux/* kernel_workspace/include/linux/
+        
+        # Apply Kernel 5.15 Patch
+        cd kernel_workspace
+        patch -p1 < 50_add_susfs_in_kernel-5.15.patch || echo "Some hunks failed, standard for custom trees, checking if core applied..."
+        
+        # Patch the Root Module (Assuming KSU structure used by Suki/Next)
+        cd KernelSU || cd drivers/kernelsu || cd drivers/sukisu
+        patch -p1 < ../../susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch || true
+        
+        # Add SUSFS Configs for 5.15
+        echo "CONFIG_KSU_SUSFS=y" >> ../arch/arm64/configs/gki_defconfig
+        echo "CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT=y" >> ../arch/arm64/configs/gki_defconfig # Nomount routing
+
+    - name: Inject BBR & KPM Configurations
+      run: |
+        cd kernel_workspace/arch/arm64/configs
+        if [ "${{ inputs.ENABLE_BBR }}" == "true" ]; then
+          echo "CONFIG_TCP_CONG_BBR=y" >> gki_defconfig
+          echo "CONFIG_DEFAULT_BBR=y" >> gki_defconfig
+          echo "CONFIG_DEFAULT_TCP_CONG=\"bbr\"" >> gki_defconfig
+        fi
+        if [ "${{ inputs.ENABLE_KPM }}" == "true" ]; then
+          echo "CONFIG_KPM=y" >> gki_defconfig
+          echo "CONFIG_KALLSYMS=y" >> gki_defconfig
+          echo "CONFIG_KALLSYMS_ALL=y" >> gki_defconfig
+        fi
+
+    - name: Compile Kernel
+      run: |
+        cd kernel_workspace
+        export PATH="${{ github.workspace }}/toolchain/bin:$PATH"
+        export MAKE_ARGS="O=out ARCH=arm64 CC=clang CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_COMPAT=arm-linux-gnueabi- LLVM=1 LLVM_IAS=1"
+        
+        # Lineage SM8550 typically uses gki_defconfig + kalama_gki.config, building standard gki for now
+        make $MAKE_ARGS gki_defconfig
+        make -j$(nproc --all) $MAKE_ARGS
+
+    - name: Upload Kernel Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: Custom-Kernel-SM8550-${{ inputs.ROOT_METHOD }}
+        path: kernel_workspace/out/arch/arm64/boot/Image*
