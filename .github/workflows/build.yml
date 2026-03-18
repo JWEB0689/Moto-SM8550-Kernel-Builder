@@ -113,7 +113,7 @@ jobs:
         make -j$(nproc --all) $MAKE_ARGS
 
     - name: Upload Kernel Artifact
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v5
       with:
         name: Custom-Kernel-SM8550-${{ inputs.ROOT_METHOD }}
         path: kernel_workspace/out/arch/arm64/boot/Image*
